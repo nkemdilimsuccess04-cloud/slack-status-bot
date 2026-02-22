@@ -8,7 +8,12 @@ const openai = new OpenAI({
 
 const db = new sqlite3.Database("./messages.db");
 
+/* ===========================
+   DATABASE SETUP
+=========================== */
 db.serialize(() => {
+
+  // Raw message history
   db.run(`
     CREATE TABLE IF NOT EXISTS messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -19,19 +24,22 @@ db.serialize(() => {
     )
   `);
 
+  // LIVE production state (one row per client)
   db.run(`
-    CREATE TABLE IF NOT EXISTS operations (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      client TEXT,
+    CREATE TABLE IF NOT EXISTS production_state (
+      client TEXT PRIMARY KEY,
       editor TEXT,
       status TEXT,
       blocked INTEGER,
-      original_text TEXT,
-      ts TEXT
+      last_update_ts TEXT
     )
   `);
+
 });
 
+/* ===========================
+   SLACK INIT
+=========================== */
 const receiver = new ExpressReceiver({
   signingSecret: process.env.SLACK_SIGNING_SECRET,
 });
@@ -42,102 +50,83 @@ const app = new App({
 });
 
 /* ===========================
-   MENTION COMMAND HANDLER
+   AI QUESTION HANDLER
 =========================== */
 app.event("app_mention", async ({ event, say }) => {
-  const text = event.text
+
+  const question = event.text
     .replace(/<@[^>]+>/g, "")
-    .trim()
-    .toLowerCase();
+    .trim();
 
-  /* ---- LAST 5 ---- */
-  if (text.includes("last 5")) {
-    db.all(
-      `SELECT text FROM messages ORDER BY id DESC LIMIT 5`,
-      [],
-      async (err, rows) => {
-        if (err || !rows || rows.length === 0) {
-          await say("No messages stored yet.");
-          return;
-        }
+  // Get current production state
+  db.all(`SELECT * FROM production_state`, [], async (err, rows) => {
 
-        const response = rows
-          .map((row, index) => `${index + 1}. ${row.text}`)
-          .join("\n");
+    if (err) {
+      await say("Error retrieving production data.");
+      return;
+    }
 
-        await say(`Here are the last 5 messages:\n${response}`);
-      }
-    );
-  }
+    if (!rows || rows.length === 0) {
+      await say("No production data available yet.");
+      return;
+    }
 
-  /* ---- BLOCKED ---- */
-  else if (text.includes("blocked")) {
-    db.all(
-      `SELECT client, editor FROM operations WHERE blocked = 1`,
-      [],
-      async (err, rows) => {
-        if (err || !rows || rows.length === 0) {
-          await say("No blocked operations found.");
-          return;
-        }
+    try {
 
-        const response = rows
-          .map(row =>
-            row.client
-              ? `Client ${row.client} is blocked`
-              : `Editor ${row.editor} is blocked`
-          )
-          .join("\n");
+      const completion = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        temperature: 0,
+        messages: [
+          {
+            role: "system",
+            content: `
+You are an internal production operations assistant.
 
-        await say(`Blocked items:\n${response}`);
-      }
-    );
-  }
+Use ONLY the provided production data to answer the user's question.
 
-  /* ---- STATUS SNAPSHOT (FIXED VERSION) ---- */
-  else if (text.includes("status")) {
-    db.all(
-      `
-      SELECT *
-      FROM operations
-      WHERE id IN (
-        SELECT MAX(id)
-        FROM operations
-        GROUP BY COALESCE(client, editor)
-      )
-      `,
-      [],
-      async (err, rows) => {
-        if (err || !rows || rows.length === 0) {
-          await say("No operations found.");
-          return;
-        }
+You may:
+- Identify blocked clients
+- Identify editors who have not delivered
+- Calculate delays using last_update_ts (Slack timestamps are Unix epoch in seconds)
+- Explain how long ago something happened
+- Summarize risks
 
-        const response = rows
-          .map(row => {
-            const name = row.client || row.editor || "Unknown";
-            const state = row.blocked
-              ? "BLOCKED"
-              : row.status || "unknown";
+If the answer cannot be determined from the data, say so clearly.
 
-            return `${name} — ${state}`;
-          })
-          .join("\n");
+Be concise, factual, and operational.
+            `
+          },
+          {
+            role: "user",
+            content: `
+Production Data:
+${JSON.stringify(rows, null, 2)}
 
-        await say(`OPERATIONS SNAPSHOT:\n\n${response}`);
-      }
-    );
-  }
+User Question:
+${question}
+            `
+          }
+        ]
+      });
 
-  else {
-    await say("Bot is alive");
-  }
+      const answer = completion.choices[0].message.content;
+
+      await say(answer);
+
+    } catch (e) {
+      console.error(e);
+      await say("AI processing failed.");
+    }
+
+  });
+
 });
 
 /* ===========================
    MESSAGE LISTENER
 =========================== */
 app.message(async ({ message }) => {
+
   if (message.subtype) return;
 
   // Store raw message
@@ -147,15 +136,17 @@ app.message(async ({ message }) => {
   );
 
   try {
+
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
+      temperature: 0,
       messages: [
         {
           role: "system",
           content: `
 Extract structured operational data from Slack messages.
 
-Return JSON ONLY with:
+Return JSON ONLY:
 {
   "client": string or null,
   "editor": string or null,
@@ -163,49 +154,47 @@ Return JSON ONLY with:
   "blocked": true | false | null
 }
 
-If irrelevant, return all null values.
-          `,
+If irrelevant return all null.
+          `
         },
         {
           role: "user",
-          content: message.text,
-        },
-      ],
-      temperature: 0,
+          content: message.text
+        }
+      ]
     });
 
     const result = JSON.parse(
       completion.choices[0].message.content
     );
 
-    // Only insert if something meaningful exists
-    if (
-      result.client ||
-      result.editor ||
-      result.status ||
-      result.blocked !== null
-    ) {
-      db.run(
-        `INSERT INTO operations (client, editor, status, blocked, original_text, ts)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [
-          result.client,
-          result.editor,
-          result.status,
-          result.blocked === null
-            ? null
-            : result.blocked
-            ? 1
-            : 0,
-          message.text,
-          message.ts,
-        ]
-      );
-    }
+    // If no meaningful production data → ignore
+    if (!result.client) return;
+
+    // UPSERT live production state
+    db.run(
+      `
+      INSERT OR REPLACE INTO production_state
+      (client, editor, status, blocked, last_update_ts)
+      VALUES (?, ?, ?, ?, ?)
+      `,
+      [
+        result.client,
+        result.editor,
+        result.status,
+        result.blocked === true
+          ? 1
+          : result.blocked === false
+          ? 0
+          : null,
+        message.ts
+      ]
+    );
 
   } catch (err) {
     console.error("OpenAI extraction failed:", err.message);
   }
+
 });
 
 /* ===========================
