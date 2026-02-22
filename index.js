@@ -27,7 +27,33 @@ const app = new App({
 
 // Mention response
 app.event("app_mention", async ({ event, say }) => {
-  await say("Bot is alive ✅");
+  const text = event.text.toLowerCase();
+
+  if (text.includes("last 5")) {
+    db.all(
+      `SELECT text FROM messages ORDER BY id DESC LIMIT 5`,
+      [],
+      async (err, rows) => {
+        if (err) {
+          await say("Error fetching messages.");
+          return;
+        }
+
+        if (!rows || rows.length === 0) {
+          await say("No messages stored yet.");
+          return;
+        }
+
+        const response = rows
+          .map((row, index) => `${index + 1}. ${row.text}`)
+          .join("\n");
+
+        await say(`Here are the last 5 messages:\n${response}`);
+      }
+    );
+  } else {
+    await say("Bot is alive ✅");
+  }
 });
 
 // Listen to all messages
