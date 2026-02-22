@@ -55,7 +55,6 @@ app.event("app_mention", async ({ event, say }) => {
     .replace(/<@[^>]+>/g, "")
     .trim();
 
-  // Pull latest state per client/editor
   db.all(
     `
     SELECT *
@@ -63,17 +62,12 @@ app.event("app_mention", async ({ event, say }) => {
     WHERE id IN (
       SELECT MAX(id)
       FROM operations
-      WHERE client IS NOT NULL OR editor IS NOT NULL
-      GROUP BY COALESCE(client, editor)
+      WHERE client IS NOT NULL
+      GROUP BY client
     )
     `,
     [],
     async (err, rows) => {
-      if (err) {
-        await say("Database error.");
-        return;
-      }
-
       if (!rows || rows.length === 0) {
         await say("No production data available yet.");
         return;
@@ -89,30 +83,28 @@ app.event("app_mention", async ({ event, say }) => {
             {
               role: "system",
               content: `
-You are an operations intelligence assistant.
+You are an internal operations intelligence assistant.
 
 You receive structured production state data.
 
-Each record includes:
+Each record contains:
 - client
 - editor
 - status
-- blocked (1, 0, or null)
+- blocked (1 or 0)
 - ts (Slack timestamp)
 - current_time
 
 You must:
-- Answer the user's question clearly
 - Identify blocked clients
 - Identify editors who have not delivered
-- Calculate time delays if asked
-- Summarize production state if requested
-- Detect waiting or in-progress items
-- Use logical reasoning
+- Detect delays
+- Calculate how long ago something happened
+- Summarize production
+- Make reasonable assumptions if data is incomplete
+- Be concise and professional
 
-If no relevant data exists, say so clearly.
-
-Respond professionally and clearly.
+If the answer cannot be determined, say so clearly.
               `,
             },
             {
@@ -133,14 +125,14 @@ ${question}
         await say(completion.choices[0].message.content);
 
       } catch (err) {
-        await say("Error processing production intelligence.");
+        await say("AI reasoning error.");
       }
     }
   );
 });
 
 /* ===========================
-   MESSAGE LISTENER
+   MESSAGE LISTENER (RESILIENT)
 =========================== */
 app.message(async ({ message }) => {
   if (message.subtype) return;
@@ -159,16 +151,17 @@ app.message(async ({ message }) => {
         {
           role: "system",
           content: `
-Extract structured operational data from Slack messages.
+Extract structured production data from Slack messages.
 
-Rules:
-- If someone says "delivered", status = delivered.
-- If someone says "blocked", blocked = true.
-- If someone says "waiting", status = waiting.
-- If someone says "in progress", status = in_progress.
-- Extract client names if mentioned.
-- Extract editor names if mentioned.
-- If message is irrelevant to production, return null for everything.
+Be tolerant of inconsistent wording.
+
+Interpret synonyms:
+- "done", "finished", "completed" → delivered
+- "working", "ongoing" → in_progress
+- "pending", "awaiting", "reviewing" → waiting
+- "stuck", "issue", "problem" → blocked
+
+If no production signal exists, return all null.
 
 Return JSON ONLY:
 {
@@ -190,31 +183,39 @@ Return JSON ONLY:
       completion.choices[0].message.content
     );
 
-    // Do not insert empty garbage
-    if (!result.client && !result.editor) return;
+    // Fetch channel name (client fallback)
+    const channelInfo = await app.client.conversations.info({
+      token: process.env.SLACK_BOT_TOKEN,
+      channel: message.channel,
+    });
+
+    const channelName = channelInfo.channel.name;
+
+    // Use channel name as client if missing
+    const clientName = result.client || channelName;
+
+    // Ignore noise (must detect status or blocked)
+    if (!result.status && result.blocked !== true) return;
 
     db.run(
       `
-      INSERT INTO operations 
+      INSERT INTO operations
       (client, editor, status, blocked, original_text, ts)
       VALUES (?, ?, ?, ?, ?, ?)
       `,
       [
-        result.client,
+        clientName,
         result.editor,
         result.status,
-        result.blocked === true
-          ? 1
-          : result.blocked === false
-          ? 0
-          : null,
+        result.blocked === true ? 1 :
+        result.blocked === false ? 0 : null,
         message.text,
         message.ts,
       ]
     );
 
   } catch (err) {
-    console.error("OpenAI extraction failed:", err.message);
+    console.error("Extraction failed:", err.message);
   }
 });
 
