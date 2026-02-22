@@ -2,15 +2,12 @@ const { App, ExpressReceiver } = require("@slack/bolt");
 const sqlite3 = require("sqlite3").verbose();
 const OpenAI = require("openai");
 
-// Initialize OpenAI
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-// Create / connect database
 const db = new sqlite3.Database("./messages.db");
 
-// Create tables
 db.serialize(() => {
   db.run(`
     CREATE TABLE IF NOT EXISTS messages (
@@ -44,7 +41,6 @@ const app = new App({
   receiver,
 });
 
-// Mention command handler
 app.event("app_mention", async ({ event, say }) => {
   const text = event.text.toLowerCase();
 
@@ -53,12 +49,7 @@ app.event("app_mention", async ({ event, say }) => {
       `SELECT text FROM messages ORDER BY id DESC LIMIT 5`,
       [],
       async (err, rows) => {
-        if (err) {
-          await say("Error fetching messages.");
-          return;
-        }
-
-        if (!rows || rows.length === 0) {
+        if (err || !rows || rows.length === 0) {
           await say("No messages stored yet.");
           return;
         }
@@ -70,24 +61,44 @@ app.event("app_mention", async ({ event, say }) => {
         await say(`Here are the last 5 messages:\n${response}`);
       }
     );
-  } else {
-    await say("Bot is alive ✅");
+  }
+
+  else if (text.includes("blocked")) {
+    db.all(
+      `SELECT client, editor FROM operations WHERE blocked = 1`,
+      [],
+      async (err, rows) => {
+        if (err || !rows || rows.length === 0) {
+          await say("No blocked operations found.");
+          return;
+        }
+
+        const response = rows
+          .map(row =>
+            row.client
+              ? `Client ${row.client} is blocked`
+              : `Editor ${row.editor} is blocked`
+          )
+          .join("\n");
+
+        await say(`Blocked items:\n${response}`);
+      }
+    );
+  }
+
+  else {
+    await say("Bot is alive");
   }
 });
 
-// Listen to all messages
 app.message(async ({ message }) => {
   if (message.subtype) return;
 
-  console.log("New message:", message.text);
-
-  // Store raw message
   db.run(
     `INSERT INTO messages (user, channel, text, ts) VALUES (?, ?, ?, ?)`,
     [message.user, message.channel, message.text, message.ts]
   );
 
-  // Extract structured intelligence with OpenAI
   try {
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
@@ -105,7 +116,7 @@ Return JSON ONLY with:
   "blocked": true | false | null
 }
 
-If message is irrelevant, return all null values.
+If irrelevant, return null for everything.
           `,
         },
         {
@@ -132,6 +143,7 @@ If message is irrelevant, return all null values.
     );
 
     console.log("Structured data stored:", result);
+
   } catch (err) {
     console.error("OpenAI extraction failed:", err.message);
   }
@@ -140,5 +152,5 @@ If message is irrelevant, return all null values.
 const port = process.env.PORT || 3000;
 
 receiver.app.listen(port, () => {
-  console.log(`⚡ Slack bot running on port ${port}`);
+  console.log(`Slack bot running on port ${port}`);
 });
