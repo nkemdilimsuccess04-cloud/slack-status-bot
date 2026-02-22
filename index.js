@@ -41,12 +41,16 @@ const app = new App({
   receiver,
 });
 
+/* ===========================
+   MENTION COMMAND HANDLER
+=========================== */
 app.event("app_mention", async ({ event, say }) => {
   const text = event.text
     .replace(/<@[^>]+>/g, "")
     .trim()
     .toLowerCase();
 
+  /* ---- LAST 5 ---- */
   if (text.includes("last 5")) {
     db.all(
       `SELECT text FROM messages ORDER BY id DESC LIMIT 5`,
@@ -66,6 +70,7 @@ app.event("app_mention", async ({ event, say }) => {
     );
   }
 
+  /* ---- BLOCKED ---- */
   else if (text.includes("blocked")) {
     db.all(
       `SELECT client, editor FROM operations WHERE blocked = 1`,
@@ -89,18 +94,17 @@ app.event("app_mention", async ({ event, say }) => {
     );
   }
 
+  /* ---- STATUS SNAPSHOT (FIXED VERSION) ---- */
   else if (text.includes("status")) {
     db.all(
       `
-      SELECT o1.client, o1.editor, o1.status, o1.blocked, o1.ts
-      FROM operations o1
-      INNER JOIN (
-          SELECT client, MAX(ts) as max_ts
-          FROM operations
-          WHERE client IS NOT NULL
-          GROUP BY client
-      ) o2
-      ON o1.client = o2.client AND o1.ts = o2.max_ts
+      SELECT *
+      FROM operations
+      WHERE id IN (
+        SELECT MAX(id)
+        FROM operations
+        GROUP BY COALESCE(client, editor)
+      )
       `,
       [],
       async (err, rows) => {
@@ -109,10 +113,16 @@ app.event("app_mention", async ({ event, say }) => {
           return;
         }
 
-        const response = rows.map(row => {
-          const state = row.blocked ? "BLOCKED" : row.status;
-          return `${row.client} — ${state} — ${row.editor || "No editor"}`;
-        }).join("\n");
+        const response = rows
+          .map(row => {
+            const name = row.client || row.editor || "Unknown";
+            const state = row.blocked
+              ? "BLOCKED"
+              : row.status || "unknown";
+
+            return `${name} — ${state}`;
+          })
+          .join("\n");
 
         await say(`OPERATIONS SNAPSHOT:\n\n${response}`);
       }
@@ -124,9 +134,13 @@ app.event("app_mention", async ({ event, say }) => {
   }
 });
 
+/* ===========================
+   MESSAGE LISTENER
+=========================== */
 app.message(async ({ message }) => {
   if (message.subtype) return;
 
+  // Store raw message
   db.run(
     `INSERT INTO messages (user, channel, text, ts) VALUES (?, ?, ?, ?)`,
     [message.user, message.channel, message.text, message.ts]
@@ -149,7 +163,7 @@ Return JSON ONLY with:
   "blocked": true | false | null
 }
 
-If irrelevant, return null for everything.
+If irrelevant, return all null values.
           `,
         },
         {
@@ -160,26 +174,43 @@ If irrelevant, return null for everything.
       temperature: 0,
     });
 
-    const result = JSON.parse(completion.choices[0].message.content);
-
-    db.run(
-      `INSERT INTO operations (client, editor, status, blocked, original_text, ts)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      [
-        result.client,
-        result.editor,
-        result.status,
-        result.blocked ? 1 : 0,
-        message.text,
-        message.ts,
-      ]
+    const result = JSON.parse(
+      completion.choices[0].message.content
     );
+
+    // Only insert if something meaningful exists
+    if (
+      result.client ||
+      result.editor ||
+      result.status ||
+      result.blocked !== null
+    ) {
+      db.run(
+        `INSERT INTO operations (client, editor, status, blocked, original_text, ts)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [
+          result.client,
+          result.editor,
+          result.status,
+          result.blocked === null
+            ? null
+            : result.blocked
+            ? 1
+            : 0,
+          message.text,
+          message.ts,
+        ]
+      );
+    }
 
   } catch (err) {
     console.error("OpenAI extraction failed:", err.message);
   }
 });
 
+/* ===========================
+   START SERVER
+=========================== */
 const port = process.env.PORT || 3000;
 
 receiver.app.listen(port, () => {
