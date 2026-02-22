@@ -9,8 +9,15 @@ const app = new App({
   receiver,
 });
 
+// When bot is mentioned
 app.event("app_mention", async ({ event, say }) => {
   await say("Bot is alive ✅");
+});
+
+// Listen to all messages
+app.message(async ({ message }) => {
+  if (message.subtype) return; // ignore bot messages
+  console.log("New message:", message.text);
 });
 
 const port = process.env.PORT || 3000;
